@@ -9,14 +9,16 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.FileSystemResource;
 import org.springframework.http.*;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
 
+import java.io.File;
 import java.time.Instant;
-import java.util.HashMap;
-import java.util.Map;
 import java.util.Optional;
 
 @Service
@@ -32,20 +34,16 @@ public class AnalysisService {
     @Value("${app.ai.engine.url}")
     private String aiEngineUrl;
 
-    public AnalysisService(AnalysisRepository analysisRepository,
-                           DatasetService datasetService,
-                           RestTemplate restTemplate,
-                           ObjectMapper objectMapper) {
+    public AnalysisService(
+            AnalysisRepository analysisRepository,
+            DatasetService datasetService,
+            RestTemplate restTemplate,
+            ObjectMapper objectMapper) {
+
         this.analysisRepository = analysisRepository;
         this.datasetService = datasetService;
         this.restTemplate = restTemplate;
         this.objectMapper = objectMapper;
-    }
-
-    public AnalysisResult getAnalysisByDatasetId(Long datasetId, User user) {
-        Dataset dataset = datasetService.getDatasetById(datasetId, user);
-        return analysisRepository.findByDataset(dataset)
-                .orElseThrow(() -> new RuntimeException("No analysis found for this dataset."));
     }
 
     public Optional<AnalysisResult> findAnalysisByDatasetId(Long datasetId) {
@@ -54,40 +52,55 @@ public class AnalysisService {
 
     @Async
     public void runAnalysisAsync(Long datasetId, User user) {
+
         Dataset dataset = datasetService.getDatasetById(datasetId, user);
         datasetService.updateDatasetStatus(datasetId, Dataset.DatasetStatus.ANALYZING);
 
         AnalysisResult analysis = analysisRepository.findByDataset(dataset)
                 .orElse(AnalysisResult.builder().dataset(dataset).build());
+
         analysis.setStatus(AnalysisResult.AnalysisStatus.RUNNING);
         analysis = analysisRepository.save(analysis);
 
         long startTime = Instant.now().toEpochMilli();
 
         try {
-            Map<String, Object> requestBody = new HashMap<>();
-            requestBody.put("dataset_id", datasetId);
-            requestBody.put("file_path", dataset.getFilePath());
-            requestBody.put("filename", dataset.getOriginalFilename());
+
+            File datasetFile = new File(dataset.getFilePath());
+
+            if (!datasetFile.exists()) {
+                throw new RuntimeException("Dataset file not found: " + dataset.getFilePath());
+            }
+
+            MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
+            body.add("file", new FileSystemResource(datasetFile));
+            body.add("dataset_id", datasetId);
 
             HttpHeaders headers = new HttpHeaders();
-            headers.setContentType(MediaType.APPLICATION_JSON);
-            HttpEntity<Map<String, Object>> entity = new HttpEntity<>(requestBody, headers);
+            headers.setContentType(MediaType.MULTIPART_FORM_DATA);
+
+            HttpEntity<MultiValueMap<String, Object>> requestEntity =
+                    new HttpEntity<>(body, headers);
 
             ResponseEntity<String> response = restTemplate.postForEntity(
-                    aiEngineUrl + "/analyze", entity, String.class);
+                    aiEngineUrl + "/analyze",
+                    requestEntity,
+                    String.class
+            );
 
             if (response.getStatusCode().is2xxSuccessful() && response.getBody() != null) {
+
                 JsonNode result = objectMapper.readTree(response.getBody());
 
-                String summaryJson  = objectMapper.writeValueAsString(result.get("summary"));
-                String chartsJson   = objectMapper.writeValueAsString(result.get("charts"));
+                String summaryJson = objectMapper.writeValueAsString(result.get("summary"));
+                String chartsJson = objectMapper.writeValueAsString(result.get("charts"));
                 String insightsText = result.has("insights") ? result.get("insights").asText() : "";
 
                 JsonNode summary = result.get("summary");
+
                 if (summary != null && summary.has("shape")) {
                     long rows = summary.get("shape").get(0).asLong();
-                    int  cols = summary.get("shape").get(1).asInt();
+                    int cols = summary.get("shape").get(1).asInt();
                     datasetService.updateDatasetStats(datasetId, rows, cols);
                 }
 
@@ -96,20 +109,28 @@ public class AnalysisService {
                 analysis.setInsightsText(insightsText);
                 analysis.setStatus(AnalysisResult.AnalysisStatus.COMPLETED);
                 analysis.setAnalysisDurationMs(Instant.now().toEpochMilli() - startTime);
+
                 analysisRepository.save(analysis);
 
                 datasetService.updateDatasetStatus(datasetId, Dataset.DatasetStatus.COMPLETED);
-                log.info("Analysis completed for dataset {} in {}ms", datasetId,
+
+                log.info("Analysis completed for dataset {} in {} ms",
+                        datasetId,
                         Instant.now().toEpochMilli() - startTime);
+
             } else {
-                throw new RuntimeException("AI engine returned an error: " + response.getStatusCode());
+                throw new RuntimeException("AI engine error: " + response.getStatusCode());
             }
 
         } catch (Exception e) {
+
             log.error("Analysis failed for dataset {}: {}", datasetId, e.getMessage());
+
             analysis.setStatus(AnalysisResult.AnalysisStatus.FAILED);
             analysis.setErrorMessage(e.getMessage());
+
             analysisRepository.save(analysis);
+
             datasetService.updateDatasetStatus(datasetId, Dataset.DatasetStatus.FAILED);
         }
     }
